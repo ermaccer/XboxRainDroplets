@@ -28,37 +28,31 @@
 #define IDR_BLURPS 103
 #define IDR_BLURVS 104              
 
-#define D3DCOLOR_ARGB(a,r,g,b) \
-    ((DWORD)((((a)&0xff)<<24)|(((r)&0xff)<<16)|(((g)&0xff)<<8)|((b)&0xff)))
-
 constexpr const char* szShadez = R"(
-// Constant buffer
-cbuffer ConstantBuffer : register(b0)
+struct VOut
 {
-	matrix proj;
-}
-
-// PSI (PixelShaderInput)
-struct PSI
-{
-	float4 pos : SV_POSITION;
-	float4 color : COLOR;
+    float4 position : SV_POSITION;
+    float4 color : COLOR;
+    float2 uv0 : TEXCOORD0;
+    float2 uv1 : TEXCOORD1;
 };
 
-// VertexShader
-PSI VS( float4 pos : POSITION, float4 color : COLOR )
+VOut VShader(float4 position : POSITION, float4 color : COLOR, float2 uv0 : TEXCOORD0, float2 uv1 : TEXCOORD1)
 {
-	PSI psi;
-	psi.color = color;
-	pos = mul( pos, proj );
-	psi.pos = pos;
-	return psi;
+    VOut output;
+
+    output.position = position;
+    output.color = color;
+    output.uv0 = uv0;
+    output.uv1 = uv1;
+
+    return output;
 }
 
-// PixelShader
-float4 PS(PSI psi) : SV_TARGET
+float4 PShader(float4 position : SV_POSITION, float4 color : COLOR, float2 uv0 : TEXCOORD0, float2 uv1 : TEXCOORD1) : SV_TARGET
 {
-	return psi.color;
+    float2 uv = float2(uv0.x, uv0.y);
+    return color;
 }
 )";
 
@@ -225,9 +219,6 @@ public:
 
     static inline void Process(IDXGISwapChain* pSwapchain)
     {
-        if (!ms_initialised)
-            return;
-
         if (!fTimeStep)
         {
             static std::list<int> m_times;
@@ -244,6 +235,9 @@ public:
                 fps = static_cast<uint32_t>(0.5f + (static_cast<float>(m_times.size() - 1) *
                     static_cast<float>(frequency.QuadPart)) / static_cast<float>(m_times.back() - m_times.front()));
         }
+
+        if (!ms_initialised)
+            Init(pSwapchain);
 
         ProcessGlobalEmitters();
         CalculateMovement();
@@ -598,28 +592,23 @@ public:
     }
 
     // Rendering static inline 
+    static inline ID3D11VertexShader* ms_vertexShader = nullptr;
+    static inline ID3D11PixelShader* ms_pixelShader = nullptr;
+
+    static inline ID3D11RenderTargetView* ms_backBuffer = nullptr;
+
     static inline ID3D11Texture2D* ms_maskTex = nullptr;
     static inline ID3D11Texture2D* ms_tex = nullptr;
     static inline ID3D11Texture2D* ms_surf = nullptr;
     static inline ID3D11Texture2D* ms_bbuf = nullptr;
-    static inline ID3D11RenderTargetView* ms_pRenderTargetView = nullptr;
-    static inline D3D11_VIEWPORT pViewports[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
-    static inline DirectX::XMMATRIX ms_proj = {};
-    static inline ID3D11Buffer* ms_constantBuffer = nullptr;
 
-    static inline ID3D11InputLayout* ms_vertexLayout = nullptr;
-    static inline ID3D11Buffer* ms_vertexBuf = nullptr;
+    static inline ID3D11InputLayout* ms_inputLayout = nullptr;
 
-    static inline ID3D11InputLayout* ms_indexLayout = nullptr;
-    static inline ID3D11Buffer* ms_indexBuf = nullptr;
-
-    static inline ID3D11VertexShader* ms_vertexShader = nullptr;
-    static inline ID3D11PixelShader* ms_pixelShader = nullptr;
+    static inline std::vector<uint16_t> ms_indexBuf = {};
 
     static inline int32_t ms_fbWidth = 0;
     static inline int32_t ms_fbHeight = 0;
-    static inline VertexTex2* ms_vertPtr = 0;
-    static inline int32_t ms_numBatchedDrops = 0;
+
     static inline int32_t ms_initialised = false;
     static inline bool ms_atlasUsed = true;
 
@@ -670,13 +659,13 @@ public:
     }
 
     static inline void Shutdown() {
-
+        ImRenderer::Shutdown();
     }
 
     static inline void Init(IDXGISwapChain* pSwapchain)
     {
         ID3D11Device* pDevice = nullptr;
-        
+
         HRESULT hResult = pSwapchain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
         if (FAILED(hResult))
             return;
@@ -687,213 +676,74 @@ public:
         if (FAILED(pContext))
             return;
 
-        ms_drops.resize(MaxDrops);
-        ms_dropsMoving.resize(MaxDropsMoving);
+        D3D11_TEXTURE2D_DESC d3dsDesc = {};
+        pContext->OMGetRenderTargets(1, &ms_backBuffer, nullptr);
 
-        D3D11_BUFFER_DESC vbufDesc = {};
-        vbufDesc.Usage = D3D11_USAGE_DYNAMIC;
-        vbufDesc.ByteWidth = ms_drops.capacity() * 4 * sizeof(VertexTex2);
-        vbufDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
-        vbufDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-        D3D11_SUBRESOURCE_DATA vbufData = {};
-        vbufData.pSysMem = ms_drops.data();
-
-        ID3D11Buffer* vbuf = nullptr;
-        pDevice->CreateBuffer(&vbufDesc, &vbufData, &vbuf);
-
-        D3D11_BUFFER_DESC ibufDesc = {};
-        ibufDesc.Usage = D3D11_USAGE_DYNAMIC;
-        ibufDesc.ByteWidth = ms_drops.capacity() * 6 * sizeof(short);
-        ibufDesc.BindFlags = D3D11_BIND_INDEX_BUFFER;
-        ibufDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
-
-        D3D11_SUBRESOURCE_DATA ibufData = {};
-        ibufData.pSysMem = ms_drops.data();
-
-        ID3D11Buffer* ibuf = nullptr;
-        pDevice->CreateBuffer(&ibufDesc, &ibufData, &ibuf);
-
-        ms_vertexBuf = vbuf;
-        ms_indexBuf = ibuf;
-        uint32_t* idx = nullptr;
-
-        D3D11_MAPPED_SUBRESOURCE mappedIndexBuffer = {};
-        pContext->Map(ibuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedIndexBuffer);
-        idx = reinterpret_cast<uint32_t*>(mappedIndexBuffer.pData);
-
-        for (auto i = 0; i < int32_t(ms_drops.capacity()); i++)
+        if (!ms_backBuffer)
         {
-            idx[i * 6 + 0] = i * 4 + 0;
-            idx[i * 6 + 1] = i * 4 + 1;
-            idx[i * 6 + 2] = i * 4 + 2;
-            idx[i * 6 + 3] = i * 4 + 0;
-            idx[i * 6 + 4] = i * 4 + 2;
-            idx[i * 6 + 5] = i * 4 + 3;
-        }
-        pContext->Unmap(ibuf, 0);
+            ID3D11Texture2D* pBackBuffer;
+            pSwapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
 
-        D3D11_TEXTURE2D_DESC d3dsDesc;
-
-        hResult = pSwapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ms_bbuf));
-        if (FAILED(hResult))
-            return;
-
-        ms_bbuf->GetDesc(&d3dsDesc);
-
-        D3D11_TEXTURE2D_DESC desc = {};
-        desc.Width = d3dsDesc.Width;
-        desc.Height = d3dsDesc.Height;
-        desc.MipLevels = 1;
-        desc.ArraySize = 1;
-        desc.Format = d3dsDesc.Format;
-        desc.SampleDesc.Count = 1;
-        desc.SampleDesc.Quality = 0;
-        desc.Usage = D3D11_USAGE_DEFAULT;
-        desc.BindFlags = D3D11_BIND_RENDER_TARGET;
-        desc.CPUAccessFlags = 0;
-        desc.MiscFlags = 0;
-
-        hResult = pDevice->CreateTexture2D(&desc, nullptr, &ms_tex);
-        if (FAILED(hResult))
-            return;
-
-        ID3D11RenderTargetView* pRTView = nullptr;
-        hResult = pDevice->CreateRenderTargetView(ms_tex, nullptr, &pRTView);
-        if (FAILED(hResult))
-            return;
-
-        ID3D11Resource* pRTResource = nullptr;
-        pRTView->GetResource(&pRTResource);
-
-        hResult = pRTResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&ms_tex);
-
-        ID3D11RenderTargetView* pRTViewArray[] = { pRTView };
-        pContext->OMSetRenderTargets(1, pRTViewArray, nullptr);
-        ID3D11Texture2D* pTexture = nullptr;
-        pRTResource->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&pTexture);
-        if (pTexture != nullptr)
-        {
-            ID3D11RenderTargetView* pLevelView = nullptr;
-            pDevice->CreateRenderTargetView(pTexture, nullptr, &pLevelView);
-            if (pLevelView != nullptr)
-            {
-                pLevelView->QueryInterface(__uuidof(ID3D11Resource), (void**)&ms_surf);
-                pLevelView->Release();
-            }
-            pTexture->Release();
-        }
-
-        pRTResource->Release();
-
-        ID3D10Blob* pBlob = nullptr;
-
-        if (!CompileShader(szShadez, "VS", "vs_5_0", &pBlob))
-            return;
-
-        hResult = pDevice->CreateVertexShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &ms_vertexShader);
-        if (FAILED(hResult))
-            return;
-
-        D3D11_INPUT_ELEMENT_DESC vLayout[] =
-        {
-            {"POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"RHW", 0, DXGI_FORMAT_R32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"EMISSIVE_COLOR", 0, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 16, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 20, D3D11_INPUT_PER_VERTEX_DATA, 0},
-            {"TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0},
-        };
-
-        hResult = pDevice->CreateInputLayout(vLayout, ARRAYSIZE(vLayout), pBlob->GetBufferPointer(),
-            pBlob->GetBufferSize(), &ms_vertexLayout);
-
-        if (FAILED(hResult))
-            return;
-
-        if (pBlob) 
-        {
-            pBlob->Release();
-            pBlob = nullptr;
-        }
-
-        if (!CompileShader(szShadez, "PS", "ps_5_0", &pBlob))
-            return;
-
-        hResult = pDevice->CreatePixelShader(pBlob->GetBufferPointer(), pBlob->GetBufferSize(), nullptr, &ms_pixelShader);
-        if (FAILED(hResult))
-            return;
-
-        UINT numViewports = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-        float fWidth = 0;
-        float fHeight = 0;
-        pContext->RSGetViewports(&numViewports, pViewports);
-        if (!numViewports || !pViewports[0].Width) {
-            HWND hWnd = FindMainWindow(GetCurrentProcessId());
-            RECT rc{ 0 };
-            if (!GetClientRect(hWnd, &rc))
-                return;
-
-            fWidth = (float)rc.right;
-            fHeight = (float)rc.bottom;
-
-            pViewports[0].Width = (float)fWidth;
-            pViewports[0].Height = (float)fHeight;
-            pViewports[0].MinDepth = 0.0f;
-            pViewports[0].MaxDepth = 1.0f;
-
-            pContext->RSSetViewports(1, pViewports);
+            pBackBuffer->GetDesc(&d3dsDesc);
+            pDevice->CreateRenderTargetView(pBackBuffer, NULL, &ms_backBuffer);
+            pBackBuffer->Release();
         }
         else 
         {
-            fWidth = (float)pViewports[0].Width;
-            fHeight = (float)pViewports[0].Height;
+            ID3D11Resource* resource = nullptr;
+            ms_backBuffer->GetResource(&resource);
+
+            ID3D11Texture2D* texture = nullptr;
+            resource->QueryInterface(IID_PPV_ARGS(&texture));    
+
+            texture->GetDesc(&d3dsDesc);
+
+            texture->Release();
+            resource->Release();
         }
 
-        D3D11_BUFFER_DESC bd{ 0 };
-        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
-        bd.ByteWidth = sizeof(ConstantBuffer);
-        bd.Usage = D3D11_USAGE_DEFAULT;
+        // Init shaders
+        ID3D10Blob* VS, * PS;
 
-        ms_proj = DirectX::XMMatrixOrthographicLH(fWidth, fHeight, 0.0f, 1.0f);
-        ConstantBuffer cb;
-        cb.proj = ms_proj;
+        CompileShader(szShadez, "VShader", "vs_4_0", &VS);
+        CompileShader(szShadez, "PShader", "ps_4_0", &PS);
 
-        D3D11_SUBRESOURCE_DATA sr{ 0 };
-        sr.pSysMem = &cb;
-        hResult = pDevice->CreateBuffer(&bd, &sr, &ms_constantBuffer);
-        if (FAILED(hResult))
-            return;
+        pDevice->CreateVertexShader(VS->GetBufferPointer(), VS->GetBufferSize(), NULL, &ms_vertexShader);
+        pDevice->CreatePixelShader(PS->GetBufferPointer(), PS->GetBufferSize(), NULL, &ms_pixelShader);
 
-        //if (pRTView) {
-        //    pRTView->Release();
-        //    pRTView = nullptr;
-        //}
+        // Init input layout
+        D3D11_INPUT_ELEMENT_DESC layout[] =
+        {
+            { "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT, 0, 28, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+            { "TEXCOORD", 1, DXGI_FORMAT_R32G32_FLOAT, 0, 36, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+        };
 
-        ms_pRenderTargetView = pRTView;
+        UINT numElements = ARRAYSIZE(layout);
+        pDevice->CreateInputLayout(layout, numElements, VS->GetBufferPointer(), VS->GetBufferSize(), &ms_inputLayout);
+
+        // Init immediate renderer
+        ImRenderer::Init(pDevice, pContext);
+
+        ms_drops.resize(MaxDrops);
+        ms_dropsMoving.resize(MaxDropsMoving);
+
+        ms_indexBuf.resize(MaxDrops * 6 * sizeof(uint16_t));
+
+        for (auto i = 0; i < MaxDrops; i++) 
+        {
+            ms_indexBuf[i * 6 + 0] = i * 4 + 0;
+            ms_indexBuf[i * 6 + 1] = i * 4 + 1;
+            ms_indexBuf[i * 6 + 2] = i * 4 + 2;
+            ms_indexBuf[i * 6 + 3] = i * 4 + 0;
+            ms_indexBuf[i * 6 + 4] = i * 4 + 2;
+            ms_indexBuf[i * 6 + 5] = i * 4 + 3;
+        }
 
         ms_fbWidth = d3dsDesc.Width;
         ms_fbHeight = d3dsDesc.Height;
         ms_scaling = ms_fbHeight / 480.0f;
-
-        HRESULT res = NULL;
-        HMODULE hm = NULL;
-        ID3D11Resource* resTex = nullptr;
-
-        GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCWSTR)&Init, &hm);
-        res = D3DX11CreateTextureFromResource(pDevice, hm,
-#ifndef SNOWDROPS
-            MAKEINTRESOURCE(IDR_DROPMASK)
-#else
-            MAKEINTRESOURCE(IDR_SNOWDROPMASK)
-#endif
-            , nullptr, nullptr, &resTex, nullptr);
-
-        hResult = resTex->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&ms_maskTex);
-
-        if (FAILED(res) || ms_maskTex == nullptr)
-        {
-            return;
-        }
 
         ms_initialised = true;
     }
@@ -931,19 +781,12 @@ public:
 
         scale = drop->size * 0.5f;
 
+        ImRenderer::SetColor4f(drop->r / 255.0f, drop->g / 255.0f, drop->b / 255.0f, drop->alpha / 255.0f);
+
         for (i = 0; i < 4; i++) {
-            ms_vertPtr->x = drop->x + xy[i * 2] * scale + ms_xOff;
-            ms_vertPtr->y = drop->y + xy[i * 2 + 1] * scale + ms_yOff;
-            ms_vertPtr->z = 0.0f;
-            ms_vertPtr->rhw = 1.0f;
-            ms_vertPtr->emissiveColor = D3DCOLOR_ARGB(drop->alpha, drop->r, drop->g, drop->b);
-            ms_vertPtr->u0 = uv[drop->uv_index][i * 2];
-            ms_vertPtr->v0 = uv[drop->uv_index][i * 2 + 1];
-            ms_vertPtr->u1 = i >= 2 ? u1_2 : u1_1;
-            ms_vertPtr->v1 = i % 3 == 0 ? v1_2 : v1_1;
-            ms_vertPtr++;
+            ImRenderer::SetTexCoords4f(uv[drop->uv_index][i * 2], uv[drop->uv_index][i * 2 + 1], i >= 2 ? u1_2 : u1_1, i % 3 == 0 ? v1_2 : v1_1);
+            ImRenderer::SetVertex2f(drop->x + xy[i * 2] * scale + ms_xOff, drop->y + xy[i * 2 + 1] * scale + ms_yOff);
         }
-        ms_numBatchedDrops++;
     }
 
     static inline void Render(IDXGISwapChain* pSwapchain)
@@ -964,42 +807,30 @@ public:
 
         pDevice->GetImmediateContext(&pContext);
 
-        D3D11_MAPPED_SUBRESOURCE mappedIndexBuffer = {};
-        ID3D11Buffer* vbuf = ms_vertexBuf;
-        pContext->Map(vbuf, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedIndexBuffer);
-        ms_vertPtr = reinterpret_cast<VertexTex2*>(mappedIndexBuffer.pData);
+        ImRenderer::SetInputLayout(ms_inputLayout);
+        ImRenderer::SetRenderTarget(ms_backBuffer);
+        ImRenderer::SetShaders(ms_vertexShader, ms_pixelShader);
+        
+        // Triangle test
+        ImRenderer::Begin();
+        ImRenderer::SetColor4f(1.0f, 0.0f, 0.0f, 1.0f);
+        ImRenderer::SetVertex2f(0.0f, 0.5f);
+        
+        ImRenderer::SetColor4f(0.0f, 1.0f, 0.0f, 1.0f);
+        ImRenderer::SetVertex2f(0.45f, -0.5f);
+        
+        ImRenderer::SetColor4f(0.0f, 0.0f, 1.0f, 1.0f);
+        ImRenderer::SetVertex2f(-0.45f, -0.5f);
+        ImRenderer::End();   
 
-        ms_numBatchedDrops = 0;
-
+        ImRenderer::Begin();
+        ImRenderer::SetIndices(ms_indexBuf);
+        
         for (auto& drop : ms_drops)
             if (drop.active)
                 AddToRenderList(&drop);
-
-        pContext->Unmap(vbuf, 0);
-
-#ifndef DISABLESTATEBLOCK
-        // TODO
-#endif
-
-        pContext->OMSetRenderTargets(1, &ms_pRenderTargetView, nullptr);
-
-        ConstantBuffer cb;
-        cb.proj = DirectX::XMMatrixTranspose(ms_proj);
-        pContext->UpdateSubresource(ms_constantBuffer, 0, nullptr, &cb, 0, 0);
-        pContext->VSSetConstantBuffers(0, 1, &ms_constantBuffer);
-
-        UINT stride = sizeof(VertexTex2);
-        UINT offset = 0;
-        pContext->IASetVertexBuffers(0, 1, &ms_vertexBuf, &stride, &offset);
-        pContext->IASetInputLayout(ms_vertexLayout);
-        pContext->IASetIndexBuffer(ms_indexBuf, DXGI_FORMAT_R32_UINT, 0);
-        pContext->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-
-        pContext->VSSetShader(ms_vertexShader, nullptr, 0);
-        pContext->PSSetShader(ms_pixelShader, nullptr, 0);
-
-        pContext->RSSetViewports(1, pViewports);
-        pContext->DrawIndexed(ms_numBatchedDrops * 6, 0, 0);
+        
+        ImRenderer::End();
     }
 };
 

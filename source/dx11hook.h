@@ -71,11 +71,6 @@ public:
 	}
 };
 
-struct ConstantBuffer
-{
-	DirectX::XMMATRIX proj;
-};
-
 class DX11Hook 
 {
 public:
@@ -85,6 +80,9 @@ public:
 	static inline uintptr_t presentOriginalPtr = 0;
 	static inline uintptr_t resizeBuffersOriginalPtr = 0;
 
+	static inline ID3D11Device* dev = nullptr;
+	static inline ID3D11DeviceContext* devcon;
+
 	static inline Event<IDXGISwapChain*> onInitEvent = {};
 	static inline Event<> onShutdownEvent = {};
 	static inline Event<IDXGISwapChain*> onPresentEvent = {};
@@ -92,16 +90,23 @@ public:
 	static inline Event<IDXGISwapChain*, UINT, UINT, UINT, DXGI_FORMAT, UINT> onAfterResizeEvent = {};
 
 	~DX11Hook() {
+		if (devcon) {
+			devcon->Release();
+			devcon = nullptr;
+		}
+
+		if (dev) {
+			dev->Release();
+			dev = nullptr;
+		}
+
 		MH_DisableHook((void*)presentPtr);
 		MH_DisableHook((void*)resizeBuffersPtr);
 		onShutdownEvent();
 	}
 
 	static inline void Init() {
-		HWND hWnd = GetDesktopWindow();
-		ID3D11Device* device = nullptr;
-		ID3D11DeviceContext* context = nullptr;
-
+		HWND hWnd = GetForegroundWindow();
 		IDXGISwapChain* swapChain = nullptr;
 		DXGI_SWAP_CHAIN_DESC swapChainDescription;
 		ZeroMemory(&swapChainDescription, sizeof(DXGI_SWAP_CHAIN_DESC));
@@ -120,9 +125,10 @@ public:
 		swapChainDescription.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
 		swapChainDescription.SampleDesc.Count = 1;
+		swapChainDescription.SampleDesc.Quality = 0;
 
-		HRESULT hResult = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_NULL, nullptr, D3D11_CREATE_DEVICE_DEBUG, &featureLevel, 1,
-			D3D11_SDK_VERSION, &swapChainDescription, &swapChain, &device, nullptr, &context);
+		HRESULT hResult = D3D11CreateDeviceAndSwapChain(nullptr, D3D_DRIVER_TYPE_REFERENCE, nullptr, 0, nullptr, 0,
+			D3D11_SDK_VERSION, &swapChainDescription, &swapChain, &dev, nullptr, &devcon);
 
 		if (FAILED(hResult))
 		{
@@ -147,12 +153,6 @@ public:
 
 		swapChain->Release();
 		swapChain = nullptr;
-
-		context->Release();
-		context = nullptr;
-
-		device->Release();
-		device = nullptr;
 
 		if (MH_CreateHook((void*)presentPtr, Present, (void**)&presentOriginalPtr) != MH_OK)
 			return;
@@ -183,5 +183,187 @@ public:
 		onAfterResizeEvent(pSwapChain, BufferCount, Width, Height, NewFormat, SwapChainFlags);
 
 		return result;
+	}
+};
+
+struct Vertex {
+	DirectX::XMFLOAT3 pos;
+	DirectX::XMFLOAT4 col;
+	DirectX::XMFLOAT2 uv0;
+	DirectX::XMFLOAT2 uv1;
+};
+
+class ImRenderer
+{
+private:
+	static inline ID3D11Device* dev = nullptr;
+	static inline ID3D11DeviceContext* devcon = nullptr;
+
+	static inline ID3D11Buffer* vb = nullptr;
+	static inline ID3D11Buffer* ib = nullptr;
+	static inline ID3D11VertexShader* vs = nullptr;
+	static inline ID3D11PixelShader* ps = nullptr;
+	static inline ID3D11InputLayout* layout = nullptr;
+	static inline ID3D11RenderTargetView* target = nullptr;
+
+	static inline std::vector<Vertex> vertices = {};
+	static inline DirectX::XMFLOAT4 color = {};
+	static inline DirectX::XMFLOAT2 uv0 = {};
+	static inline DirectX::XMFLOAT2 uv1 = {};
+
+	static inline std::vector<uint16_t> indices = {};
+
+public:
+	static inline void Begin()
+	{
+		vertices.clear();
+		indices.clear();
+		color = { 1.0f, 1.0f, 1.0f, 1.0f };
+		uv0 = { 0.0f, 0.0f };
+		uv1 = { 0.0f, 0.0f };
+	}
+
+	static inline void End()
+	{
+		Update();
+		Render();
+	}
+
+	static inline void SetColor4f(float r, float g, float b, float a)
+	{
+		color = { r, g, b, a };
+	}
+
+	static inline void SetColor3f(float r, float g, float b)
+	{
+		SetColor4f(r, g, b, 1.0f);
+	}
+
+	static inline void SetTexCoords4f(float x1, float y1, float x2, float y2) 
+	{
+		uv0 = { x1, y1 };
+		uv1 = { x2, y2 };
+	}
+
+	static inline void SetTexCoords2f(float x, float y) {
+		SetTexCoords4f(x, y, x, y);
+	}
+
+	static inline void SetVertex3f(float x, float y, float z)
+	{
+		Vertex v;
+		v.pos.x = x;
+		v.pos.y = y;
+		v.pos.z = z;
+		v.col = color;
+		v.uv0 = uv0;
+		v.uv1 = uv1;
+
+		vertices.push_back(v);
+	}
+
+	static inline void SetIndex1i(uint16_t i) 
+	{
+		indices.push_back(i);
+	}
+
+	static inline void SetIndices(std::vector<uint16_t> const& i) 
+	{
+		indices = i;
+	}
+
+	static inline void SetVertex2f(float x, float y)
+	{
+		SetVertex3f(x, y, 0.0f);
+	}
+
+	static inline void Init(ID3D11Device* device, ID3D11DeviceContext* context)
+	{
+		dev = device;
+		devcon = context;
+
+		D3D11_BUFFER_DESC bufferDesc;
+		ZeroMemory(&bufferDesc, sizeof(bufferDesc));
+
+		bufferDesc.Usage = D3D11_USAGE_DYNAMIC;
+		bufferDesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
+		bufferDesc.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+		bufferDesc.MiscFlags = 0;
+		bufferDesc.ByteWidth = sizeof(Vertex) * 65536;
+
+		dev->CreateBuffer(&bufferDesc, nullptr, &vb);
+
+		bufferDesc.BindFlags = D3D11_BIND_INDEX_BUFFER;
+		dev->CreateBuffer(&bufferDesc, nullptr, &ib);
+	}
+
+	static inline void Shutdown()
+	{
+		if (vb)
+		{
+			vb->Release();
+			vb = nullptr;
+		}
+
+		if (ib)
+		{
+			ib->Release();
+			ib = nullptr;
+		}
+	}
+
+	static inline void SetInputLayout(ID3D11InputLayout* l)
+	{
+		layout = l;
+	}
+
+	static inline void SetRenderTarget(ID3D11RenderTargetView* t)
+	{
+		target = t;
+	}
+
+	static inline void SetShaders(ID3D11VertexShader* v, ID3D11PixelShader* p)
+	{
+		vs = v;
+		ps = p;
+	}
+
+private:
+	static inline void Update()
+	{
+		if (indices.empty()) 
+		{
+			uint16_t i = 0;
+			for (auto& it : vertices) {
+				indices.push_back(i++);
+			}
+		}
+
+		D3D11_MAPPED_SUBRESOURCE mappedResource;
+
+		devcon->Map(vb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+		memcpy(mappedResource.pData, vertices.data(), vertices.size() * sizeof(Vertex));
+		devcon->Unmap(vb, 0);
+
+		devcon->Map(ib, 0, D3D11_MAP_WRITE_DISCARD, 0, &mappedResource);
+		memcpy(mappedResource.pData, indices.data(), indices.size() * sizeof(uint16_t));
+		devcon->Unmap(ib, 0);
+	}
+
+	static inline void Render()
+	{
+		UINT stride = sizeof(Vertex);
+		UINT offset = 0;
+		devcon->IASetVertexBuffers(0, 1, &vb, &stride, &offset);
+		devcon->IASetIndexBuffer(ib, DXGI_FORMAT_R16_UINT, 0);
+		devcon->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+
+		devcon->IASetInputLayout(layout);
+
+		devcon->OMSetRenderTargets(1, &target, nullptr);
+		devcon->VSSetShader(vs, nullptr, 0);
+		devcon->PSSetShader(ps, nullptr, 0);
+
+		devcon->DrawIndexed(indices.size(), 0, 0);
 	}
 };

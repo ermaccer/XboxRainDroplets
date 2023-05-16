@@ -18,11 +18,6 @@ void Init()
 
     WaterDrops::ReadIniSettings();
 
-    DX11Hook::onInitEvent += [](IDXGISwapChain* pSwapChain)
-    {
-        WaterDrops::Init(pSwapChain);
-    };
-
     DX11Hook::onPresentEvent += [](IDXGISwapChain* pSwapChain)
     {
         WaterDrops::Process(pSwapChain);
