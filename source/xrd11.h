@@ -23,12 +23,23 @@
 #include "includes/ModuleList.hpp"
 #include "includes/FileWatch.hpp"
 
+#include "dropmask.h"
+
 #define IDR_DROPMASK 100
 #define IDR_SNOWDROPMASK 101
 #define IDR_BLURPS 103
 #define IDR_BLURVS 104              
 
 constexpr const char* szShadez = R"(
+cbuffer ConstantBuffer : register(b0)
+{
+    matrix projection;
+};
+
+Texture2D tex0 : register(t0);
+Texture2D mask0 : register(t1);
+SamplerState sampler0 : register(s0);
+
 struct VOut
 {
     float4 position : SV_POSITION;
@@ -41,7 +52,7 @@ VOut VShader(float4 position : POSITION, float4 color : COLOR, float2 uv0 : TEXC
 {
     VOut output;
 
-    output.position = position;
+    output.position = mul(position, projection);
     output.color = color;
     output.uv0 = uv0;
     output.uv1 = uv1;
@@ -51,8 +62,10 @@ VOut VShader(float4 position : POSITION, float4 color : COLOR, float2 uv0 : TEXC
 
 float4 PShader(float4 position : SV_POSITION, float4 color : COLOR, float2 uv0 : TEXCOORD0, float2 uv1 : TEXCOORD1) : SV_TARGET
 {
-    float2 uv = float2(uv0.x, uv0.y);
-    return color;
+    float4 mainColor = tex0.Sample(sampler0, uv0);
+    float4 maskColor = mask0.Sample(sampler0, uv0);
+
+    return mainColor * maskColor * color;
 }
 )";
 
@@ -566,10 +579,11 @@ public:
             }
         };
 
-        SafeRelease(&ms_maskTex);
         SafeRelease(&ms_tex);
-        SafeRelease(&ms_surf);
-        SafeRelease(&ms_bbuf);
+        SafeRelease(&ms_texRes);
+
+        SafeRelease(&ms_maskTex);
+        SafeRelease(&ms_maskTexRes);
         ms_initialised = 0;
     }
 
@@ -597,10 +611,11 @@ public:
 
     static inline ID3D11RenderTargetView* ms_backBuffer = nullptr;
 
-    static inline ID3D11Texture2D* ms_maskTex = nullptr;
     static inline ID3D11Texture2D* ms_tex = nullptr;
-    static inline ID3D11Texture2D* ms_surf = nullptr;
-    static inline ID3D11Texture2D* ms_bbuf = nullptr;
+    static inline ID3D11ShaderResourceView* ms_texRes = nullptr;
+
+    static inline ID3D11Texture2D* ms_maskTex = nullptr;
+    static inline ID3D11ShaderResourceView* ms_maskTexRes = nullptr;
 
     static inline ID3D11InputLayout* ms_inputLayout = nullptr;
 
@@ -608,6 +623,7 @@ public:
 
     static inline int32_t ms_fbWidth = 0;
     static inline int32_t ms_fbHeight = 0;
+    static inline int32_t ms_numBatchedDrops;
 
     static inline int32_t ms_initialised = false;
     static inline bool ms_atlasUsed = true;
@@ -662,11 +678,11 @@ public:
         ImRenderer::Shutdown();
     }
 
-    static inline void Init(IDXGISwapChain* pSwapchain)
+    static inline void Init(IDXGISwapChain* pSwapChain)
     {
         ID3D11Device* pDevice = nullptr;
 
-        HRESULT hResult = pSwapchain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
+        HRESULT hResult = pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
         if (FAILED(hResult))
             return;
 
@@ -682,7 +698,7 @@ public:
         if (!ms_backBuffer)
         {
             ID3D11Texture2D* pBackBuffer;
-            pSwapchain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+            pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
 
             pBackBuffer->GetDesc(&d3dsDesc);
             pDevice->CreateRenderTargetView(pBackBuffer, NULL, &ms_backBuffer);
@@ -705,8 +721,8 @@ public:
         // Init shaders
         ID3D10Blob* VS, * PS;
 
-        CompileShader(szShadez, "VShader", "vs_4_0", &VS);
-        CompileShader(szShadez, "PShader", "ps_4_0", &PS);
+        CompileShader(szShadez, "VShader", "vs_5_0", &VS);
+        CompileShader(szShadez, "PShader", "ps_5_0", &PS);
 
         pDevice->CreateVertexShader(VS->GetBufferPointer(), VS->GetBufferSize(), NULL, &ms_vertexShader);
         pDevice->CreatePixelShader(PS->GetBufferPointer(), PS->GetBufferSize(), NULL, &ms_pixelShader);
@@ -741,11 +757,42 @@ public:
             ms_indexBuf[i * 6 + 5] = i * 4 + 3;
         }
 
+        static constexpr auto MaskSize = 128;
+        uint8_t* pixels = new uint8_t[MaskSize * MaskSize * 4];
+
+        std::memset(pixels, 0xFF, MaskSize * MaskSize * 4);
+
+        ms_tex = ImRenderer::CreateTexture(MaskSize, MaskSize, 4, pixels);
+        pDevice->CreateShaderResourceView(ms_tex, nullptr, &ms_texRes);
+
         ms_fbWidth = d3dsDesc.Width;
         ms_fbHeight = d3dsDesc.Height;
         ms_scaling = ms_fbHeight / 480.0f;
 
-        ms_initialised = true;
+        ms_maskTex = ImRenderer::CreateTexture(300, 300, 4, (uint8_t*)dropMask);
+
+        if (!ms_maskTex)
+        {
+            int32_t stride = MaskSize * 4;
+            for (int y = 0; y < MaskSize; y++)
+            {
+                float yf = ((y + 0.5f) / MaskSize - 0.5f) * 2.0f;
+                for (int x = 0; x < MaskSize; x++)
+                {
+                    float xf = ((x + 0.5f) / MaskSize - 0.5f) * 2.0f;
+                    memset(&pixels[y * stride + x * 4], xf * xf + yf * yf < 1.0f ? 0xFF : 0x00, 4);
+                }
+            }
+
+            ms_maskTex = ImRenderer::CreateTexture(MaskSize, MaskSize, 4, pixels);
+            ms_atlasUsed = false;
+        }
+
+        delete[] pixels;
+
+        pDevice->CreateShaderResourceView(ms_maskTex, nullptr, &ms_maskTexRes);
+
+        ms_initialised = 1;
     }
 
     static inline void AddToRenderList(WaterDrop* drop)
@@ -784,12 +831,14 @@ public:
         ImRenderer::SetColor4f(drop->r / 255.0f, drop->g / 255.0f, drop->b / 255.0f, drop->alpha / 255.0f);
 
         for (i = 0; i < 4; i++) {
-            ImRenderer::SetTexCoords4f(uv[drop->uv_index][i * 2], uv[drop->uv_index][i * 2 + 1], i >= 2 ? u1_2 : u1_1, i % 3 == 0 ? v1_2 : v1_1);
+            ImRenderer::SetTexCoords4f(uv[drop->uv_index][i * 2], uv[drop->uv_index][i * 2 + 1],
+                i >= 2 ? u1_2 : u1_1, i % 3 == 0 ? v1_2 : v1_1);
             ImRenderer::SetVertex2f(drop->x + xy[i * 2] * scale + ms_xOff, drop->y + xy[i * 2 + 1] * scale + ms_yOff);
         }
+        ms_numBatchedDrops++;
     }
 
-    static inline void Render(IDXGISwapChain* pSwapchain)
+    static inline void Render(IDXGISwapChain* pSwapChain)
     {
         if (!ms_enabled || ms_numDrops <= 0)
             return;
@@ -800,37 +849,115 @@ public:
         ID3D11Device* pDevice = nullptr;
         ID3D11DeviceContext* pContext = nullptr;
 
-        HRESULT hResult = pSwapchain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
+        HRESULT hResult = pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
 
         if (FAILED(hResult))
             return;
 
         pDevice->GetImmediateContext(&pContext);
 
+        // Get window size
+        HWND hWnd = FindMainWindow(GetCurrentProcessId());
+        RECT rc{ 0 };
+        GetClientRect(hWnd, &rc);
+        float width = (float)rc.right;
+        float height = (float)rc.bottom;
+
+        ImRenderer::SetViewport(0, 0, width, height);
+        ImRenderer::SetProjectionMode(ImRenderer::PROJECTION_ORTHO);
+
         ImRenderer::SetInputLayout(ms_inputLayout);
         ImRenderer::SetRenderTarget(ms_backBuffer);
         ImRenderer::SetShaders(ms_vertexShader, ms_pixelShader);
-        
-        // Triangle test
-        ImRenderer::Begin();
-        ImRenderer::SetColor4f(1.0f, 0.0f, 0.0f, 1.0f);
-        ImRenderer::SetVertex2f(0.0f, 0.5f);
-        
-        ImRenderer::SetColor4f(0.0f, 1.0f, 0.0f, 1.0f);
-        ImRenderer::SetVertex2f(0.45f, -0.5f);
-        
-        ImRenderer::SetColor4f(0.0f, 0.0f, 1.0f, 1.0f);
-        ImRenderer::SetVertex2f(-0.45f, -0.5f);
-        ImRenderer::End();   
 
-        ImRenderer::Begin();
-        ImRenderer::SetIndices(ms_indexBuf);
-        
+        ImRenderer::Begin();  
+
+        ms_numBatchedDrops = 0;
         for (auto& drop : ms_drops)
             if (drop.active)
                 AddToRenderList(&drop);
-        
+
+        D3D11_RASTERIZER_DESC rasterizerDesc;
+        ZeroMemory(&rasterizerDesc, sizeof(rasterizerDesc));
+        rasterizerDesc.CullMode = D3D11_CULL_NONE;
+        rasterizerDesc.FillMode = D3D11_FILL_SOLID;
+        ID3D11RasterizerState* pRasterizerState = nullptr;
+        pDevice->CreateRasterizerState(&rasterizerDesc, &pRasterizerState);
+        pContext->RSSetState(pRasterizerState);
+        pRasterizerState->Release();
+
+        pContext->OMSetDepthStencilState(nullptr, 0);
+
+        D3D11_BLEND_DESC blendDesc;
+        ZeroMemory(&blendDesc, sizeof(blendDesc));
+        blendDesc.RenderTarget[0].BlendEnable = TRUE;
+        blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        ID3D11BlendState* pBlendState = nullptr;
+        pDevice->CreateBlendState(&blendDesc, &pBlendState);
+        const float blendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        pContext->OMSetBlendState(pBlendState, blendFactor, 0xFFFFFFFF);
+        pBlendState->Release();
+
+        ImRenderer::SetTexture(ms_texRes, ms_maskTexRes);
+
+        ImRenderer::SetIndices(ms_indexBuf, ms_numBatchedDrops * 6);
         ImRenderer::End();
+    }
+
+    static inline void BeforeResize(IDXGISwapChain* pSwapChain) {
+        ID3D11Device* pDevice = nullptr;
+
+        HRESULT hResult = pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
+        if (FAILED(hResult))
+            return;
+
+        ID3D11DeviceContext* pContext = nullptr;
+
+        pDevice->GetImmediateContext(&pContext);
+        if (FAILED(pContext))
+            return;
+
+        if (ms_backBuffer)
+        {
+            pContext->OMSetRenderTargets(0, nullptr, nullptr);
+            ms_backBuffer->Release();
+        }
+    }
+
+    static inline void AfterResize(IDXGISwapChain* pSwapChain, uint32_t width, uint32_t height) {
+        ID3D11Device* pDevice = nullptr;
+
+        HRESULT hResult = pSwapChain->GetDevice(__uuidof(ID3D11Device), (void**)&pDevice);
+        if (FAILED(hResult))
+            return;
+
+        ID3D11DeviceContext* pContext = nullptr;
+
+        pDevice->GetImmediateContext(&pContext);
+        if (FAILED(pContext))
+            return;
+
+        ID3D11Texture2D* pBackBuffer;
+        pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
+        pDevice->CreateRenderTargetView(pBackBuffer, NULL, &ms_backBuffer);
+        pBackBuffer->Release();
+
+        D3D11_VIEWPORT viewport;
+        viewport.MinDepth = 0.0f;
+        viewport.MaxDepth = 1.0f;
+        viewport.TopLeftX = 0;
+        viewport.TopLeftY = 0;
+        viewport.Width = width;
+        viewport.Height = height;
+
+        pContext->OMSetRenderTargets(1, &ms_backBuffer, NULL);
+        pContext->RSSetViewports(1, &viewport);
     }
 };
 
