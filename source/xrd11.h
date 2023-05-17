@@ -610,6 +610,7 @@ public:
     static inline ID3D11PixelShader* ms_pixelShader = nullptr;
 
     static inline ID3D11RenderTargetView* ms_backBuffer = nullptr;
+    static inline ID3D11Texture2D* ms_bbufTex = nullptr;
 
     static inline ID3D11Texture2D* ms_tex = nullptr;
     static inline ID3D11ShaderResourceView* ms_texRes = nullptr;
@@ -695,28 +696,8 @@ public:
         D3D11_TEXTURE2D_DESC d3dsDesc = {};
         pContext->OMGetRenderTargets(1, &ms_backBuffer, nullptr);
 
-        if (!ms_backBuffer)
-        {
-            ID3D11Texture2D* pBackBuffer;
-            pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), (LPVOID*)&pBackBuffer);
-
-            pBackBuffer->GetDesc(&d3dsDesc);
-            pDevice->CreateRenderTargetView(pBackBuffer, NULL, &ms_backBuffer);
-            pBackBuffer->Release();
-        }
-        else 
-        {
-            ID3D11Resource* resource = nullptr;
-            ms_backBuffer->GetResource(&resource);
-
-            ID3D11Texture2D* texture = nullptr;
-            resource->QueryInterface(IID_PPV_ARGS(&texture));    
-
-            texture->GetDesc(&d3dsDesc);
-
-            texture->Release();
-            resource->Release();
-        }
+        pSwapChain->GetBuffer(0, __uuidof(ID3D11Texture2D), reinterpret_cast<void**>(&ms_bbufTex));
+        ms_bbufTex->GetDesc(&d3dsDesc);
 
         // Init shaders
         ID3D10Blob* VS, * PS;
@@ -757,13 +738,7 @@ public:
             ms_indexBuf[i * 6 + 5] = i * 4 + 3;
         }
 
-        static constexpr auto MaskSize = 128;
-        uint8_t* pixels = new uint8_t[MaskSize * MaskSize * 4];
-
-        std::memset(pixels, 0xFF, MaskSize * MaskSize * 4);
-
-        ms_tex = ImRenderer::CreateTexture(MaskSize, MaskSize, 4, pixels);
-        pDevice->CreateShaderResourceView(ms_tex, nullptr, &ms_texRes);
+        ms_tex = ImRenderer::CreateTexture(d3dsDesc.Width, d3dsDesc.Height, 4, nullptr);
 
         ms_fbWidth = d3dsDesc.Width;
         ms_fbHeight = d3dsDesc.Height;
@@ -773,6 +748,9 @@ public:
 
         if (!ms_maskTex)
         {
+            static constexpr auto MaskSize = 128;
+            uint8_t* pixels = new uint8_t[MaskSize * MaskSize * 4];
+
             int32_t stride = MaskSize * 4;
             for (int y = 0; y < MaskSize; y++)
             {
@@ -786,10 +764,8 @@ public:
 
             ms_maskTex = ImRenderer::CreateTexture(MaskSize, MaskSize, 4, pixels);
             ms_atlasUsed = false;
+            delete[] pixels;
         }
-
-        delete[] pixels;
-
         pDevice->CreateShaderResourceView(ms_maskTex, nullptr, &ms_maskTexRes);
 
         ms_initialised = 1;
@@ -870,6 +846,16 @@ public:
         ImRenderer::SetRenderTarget(ms_backBuffer);
         ImRenderer::SetShaders(ms_vertexShader, ms_pixelShader);
 
+        if (ms_texRes) 
+        {
+            ms_texRes->Release();
+            ms_texRes = nullptr;
+        }
+
+        pContext->CopyResource(ms_tex, ms_bbufTex);
+        pDevice->CreateShaderResourceView(ms_tex, nullptr, &ms_texRes);
+   
+        ImRenderer::SetTexture(ms_texRes, ms_maskTexRes);
         ImRenderer::Begin();  
 
         ms_numBatchedDrops = 0;
@@ -903,8 +889,6 @@ public:
         const float blendFactor[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
         pContext->OMSetBlendState(pBlendState, blendFactor, 0xFFFFFFFF);
         pBlendState->Release();
-
-        ImRenderer::SetTexture(ms_texRes, ms_maskTexRes);
 
         ImRenderer::SetIndices(ms_indexBuf, ms_numBatchedDrops * 6);
         ImRenderer::End();

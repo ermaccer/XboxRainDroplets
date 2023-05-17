@@ -253,9 +253,6 @@ public:
 		color = { 1.0f, 1.0f, 1.0f, 1.0f };
 		uv0 = { 0.0f, 0.0f };
 		uv1 = { 0.0f, 0.0f };
-
-		tex = nullptr;
-		mask = nullptr;
 	}
 
 	static inline void End()
